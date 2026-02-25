@@ -1,89 +1,68 @@
-"""
-main.py
--------
-Hauptskript: Training des Neural-ODE-Controllers, Berechnung der
-Referenzlösung und Erstellung des Ergebnis-Plots.
+"""Entry point for training a Neural ODE optimal controller.
 
-Ausführen:
-  cd neural_ode_control
-  pip install -r requirements.txt
-  python main.py
+Solves the linear block-with-friction optimal control problem:
+    dx/dt = v
+    dv/dt = u(t) - mu * v
+
+by parameterising the control u(t) as a neural network and
+differentiating through an ODE solver (backprop-through-solver).
+
+A closed-form LQR reference solution is computed for comparison.
+
+Usage
+-----
+    pip install -r requirements.txt
+    python main.py
 """
 
-import sys
-import torch
 import numpy as np
+import torch
 from torchdiffeq import odeint
 
-# Eigene Module
+from analytical import solve_reference
 from controller import NeuralController
 from dynamics import BlockDynamics
 from trainer import train
-from analytical import solve_reference
 from visualization import plot_results
 
-
-# ===========================================================================
-# Konfiguration
-# ===========================================================================
 CONFIG: dict = {
-    # --- System ---
-    "z0":        [0.0, 1.0],    # Anfangszustand (x0, v0)
-    "z_target":  [1.0, 1.0],   # Zielzustand    (xT, vT)
-    "T":         2.0,           # Zeithorizont
-    "mu":        0.5,           # Reibungskoeffizient
-
-    # --- Netz ---
+    # System
+    "z0": [0.0, 1.0],
+    "z_target": [1.0, 1.0],
+    "T": 2.0,
+    "mu": 0.5,
+    # Network
     "hidden_dim": 32,
-    "n_layers":   4,
-
-    # --- Loss ---
+    "n_layers": 4,
+    # Loss weights
     "w_terminal": 100.0,
-    "w_energy":   0.01,
-
-    # --- Training ---
-    "lr":         1e-3,
-    "n_epochs":   3000,
-    "early_stop": 1e-3,         # Euklidischer Fehler ||z(T)-z*|| < early_stop
-
-    # --- ODE-Solver ---
-    "solver":     "dopri5",
-    "n_eval":     200,          # Auswertungspunkte in [0, T]
-    "rtol":       1e-7,
-    "atol":       1e-9,
-
-    # --- Sonstiges ---
-    "seed":       42,
-    "save_path":  "results.png",
+    "w_energy": 0.01,
+    # Training
+    "lr": 1e-3,
+    "n_epochs": 3000,
+    "early_stop": 1e-3,
+    # ODE solver
+    "solver": "dopri5",
+    "n_eval": 200,
+    "rtol": 1e-7,
+    "atol": 1e-9,
+    # Misc
+    "seed": 42,
+    "save_path": "results.png",
 }
 
 
 def main() -> None:
-    # -----------------------------------------------------------------------
-    # Reproduzierbarkeit
-    # -----------------------------------------------------------------------
+    """Train the neural controller, compute the LQR reference, and plot."""
     torch.manual_seed(CONFIG["seed"])
     np.random.seed(CONFIG["seed"])
-
-    # float64 global als Standard-Dtype
     torch.set_default_dtype(torch.float64)
 
     device = torch.device("cpu")
     dtype = torch.float64
 
-    print("=" * 62)
-    print("  Neural ODE Optimal Control – Block mit Reibung")
-    print("=" * 62)
-    print(f"  Anfangszustand:  z0 = {CONFIG['z0']}")
-    print(f"  Zielzustand:     z* = {CONFIG['z_target']}")
-    print(f"  Zeithorizont:    T  = {CONFIG['T']}")
-    print(f"  Reibung:         mu = {CONFIG['mu']}")
-    print(f"  Epochen:         {CONFIG['n_epochs']}  (Early-Stop: ||z(T)-z*|| < {CONFIG['early_stop']:.0e})")
-    print("=" * 62)
+    _print_header(CONFIG)
 
-    # -----------------------------------------------------------------------
-    # Modell initialisieren
-    # -----------------------------------------------------------------------
     controller = NeuralController(
         hidden_dim=CONFIG["hidden_dim"],
         n_layers=CONFIG["n_layers"],
@@ -93,59 +72,47 @@ def main() -> None:
     dynamics = BlockDynamics(controller=controller, mu=CONFIG["mu"])
 
     n_params = sum(p.numel() for p in controller.parameters())
-    print(f"\nController-Parameter: {n_params}")
+    print(f"\nController parameters: {n_params}")
 
-    # -----------------------------------------------------------------------
-    # Training
-    # -----------------------------------------------------------------------
     print("\n--- Training ---")
     controller, history = train(controller, dynamics, CONFIG)
 
-    # -----------------------------------------------------------------------
-    # Finale Trajektorie auswerten
-    # -----------------------------------------------------------------------
     t_eval = torch.linspace(0.0, CONFIG["T"], CONFIG["n_eval"], dtype=dtype, device=device)
-    z0_t = torch.tensor(CONFIG["z0"], dtype=dtype, device=device)
+    z0_tensor = torch.tensor(CONFIG["z0"], dtype=dtype, device=device)
 
     controller.eval()
     with torch.no_grad():
         z_traj = odeint(
-            dynamics, z0_t, t_eval,
+            dynamics,
+            z0_tensor,
+            t_eval,
             method=CONFIG["solver"],
             rtol=CONFIG["rtol"],
             atol=CONFIG["atol"],
         )
         u_traj = controller.get_control_trajectory(t_eval)
 
-    t_np   = t_eval.numpy()
-    z_np   = z_traj.numpy()     # (N, 2)
-    u_np   = u_traj.numpy()     # (N,)
+    t_np = t_eval.numpy()
+    z_np = z_traj.numpy()
+    u_np = u_traj.numpy()
 
-    z_T    = z_np[-1]
-    err    = np.linalg.norm(z_T - np.array(CONFIG["z_target"]))
+    z_final = z_np[-1]
+    target = np.array(CONFIG["z_target"])
+    error = np.linalg.norm(z_final - target)
 
-    print("\n--- Ergebnis Neural ODE ---")
-    print(f"  Erreichter Endzustand:  x(T) = {z_T[0]:.6f}, v(T) = {z_T[1]:.6f}")
-    print(f"  Zielzustand:            x*   = {CONFIG['z_target'][0]}, v* = {CONFIG['z_target'][1]}")
-    print(f"  Euklidischer Fehler:    ||z(T) - z*|| = {err:.4e}")
-    print(f"  Finaler Gesamt-Loss:    {history['total'][-1]:.6f}")
-    print(f"  Finaler Terminal-Loss:  {history['terminal'][-1]:.6f}")
-    print(f"  Finaler Energie-Loss:   {history['energy'][-1]:.6f}")
+    print("\n--- Neural ODE result ---")
+    print(f"  Final state:       x(T) = {z_final[0]:.6f}, v(T) = {z_final[1]:.6f}")
+    print(f"  Target:            x*   = {target[0]}, v* = {target[1]}")
+    print(f"  Euclidean error:   {error:.4e}")
+    print(f"  Final total loss:  {history['total'][-1]:.6f}")
 
-    # -----------------------------------------------------------------------
-    # Referenzlösung (scipy Direct Shooting)
-    # -----------------------------------------------------------------------
-    print("\n--- Referenzlösung ---")
+    print("\n--- Reference solution ---")
     ref = solve_reference(CONFIG, n_nodes=CONFIG["n_eval"])
+    ref_final = np.array([ref["x"][-1], ref["v"][-1]])
+    ref_error = np.linalg.norm(ref_final - target)
+    print(f"  Euclidean error:   {ref_error:.4e}")
 
-    ref_T = np.array([ref["x"][-1], ref["v"][-1]])
-    ref_err = np.linalg.norm(ref_T - np.array(CONFIG["z_target"]))
-    print(f"  Euklidischer Fehler Referenz: {ref_err:.4e}")
-
-    # -----------------------------------------------------------------------
-    # Visualisierung
-    # -----------------------------------------------------------------------
-    print(f"\n--- Plot ---")
+    print("\n--- Plot ---")
     plot_results(
         t_nn=t_np,
         z_nn=z_np,
@@ -155,8 +122,20 @@ def main() -> None:
         config=CONFIG,
         save_path=CONFIG["save_path"],
     )
+    print("\n=== Done ===")
 
-    print("\n=== Fertig! ===")
+
+def _print_header(config: dict) -> None:
+    """Print a summary of the run configuration."""
+    print("=" * 62)
+    print("  Neural ODE Optimal Control – Block with Friction")
+    print("=" * 62)
+    print(f"  Initial state:  z0 = {config['z0']}")
+    print(f"  Target state:   z* = {config['z_target']}")
+    print(f"  Time horizon:   T  = {config['T']}")
+    print(f"  Friction:       mu = {config['mu']}")
+    print(f"  Epochs:         {config['n_epochs']}  (early stop: ||z(T)-z*|| < {config['early_stop']:.0e})")
+    print("=" * 62)
 
 
 if __name__ == "__main__":
