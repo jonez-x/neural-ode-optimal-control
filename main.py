@@ -1,142 +1,133 @@
-"""Entry point for training a Neural ODE optimal controller.
+"""CLI entry point for the Neural ODE optimal control platform.
 
-Solves the linear block-with-friction optimal control problem:
-    dx/dt = v
-    dv/dt = u(t) - mu * v
-
-by parameterising the control u(t) as a neural network and
-differentiating through an ODE solver (backprop-through-solver).
-
-A closed-form LQR reference solution is computed for comparison.
+Uses the new modular package structure while keeping the original
+CLI workflow intact.  Defaults to the 1D block-with-friction problem.
 
 Usage
 -----
-    pip install -r requirements.txt
-    python main.py
+    python main.py                  # run block_1d (default)
+    python main.py obstacle_2d     # run 2D obstacle problem
 """
+
+import sys
+from pathlib import Path
+
+# Ensure project root is on sys.path
+_root = str(Path(__file__).resolve().parent)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
 
 import numpy as np
 import torch
 from torchdiffeq import odeint
 
-from analytical import solve_reference
-from controller import NeuralController
-from dynamics import BlockDynamics
-from trainer import train
-from visualization import plot_results
+# Trigger problem registration
+import problems  # noqa: F401
 
-CONFIG: dict = {
-    # System
-    "z0": [0.0, 1.0],
-    "z_target": [1.0, 1.0],
-    "T": 2.0,
-    "mu": 0.5,
-    # Network
-    "hidden_dim": 32,
-    "n_layers": 4,
-    # Loss weights
-    "w_terminal": 100.0,
-    "w_energy": 0.01,
-    # Training
-    "lr": 1e-3,
-    "n_epochs": 3000,
-    "early_stop": 1e-3,
-    # ODE solver
-    "solver": "dopri5",
-    "n_eval": 200,
-    "rtol": 1e-7,
-    "atol": 1e-9,
-    # Misc
-    "seed": 42,
-    "save_path": "results.png",
-}
+from neural_ode_control.controller import NeuralController
+from neural_ode_control.registry import get_problem, list_problems
+from neural_ode_control.trainer import train
 
 
-def main() -> None:
-    """Train the neural controller, compute the LQR reference, and plot."""
-    torch.manual_seed(CONFIG["seed"])
-    np.random.seed(CONFIG["seed"])
+def main(problem_name: str = "block_1d") -> None:
+    """Train a neural controller for the given problem and plot results."""
+    problem = get_problem(problem_name)
+    config = problem.default_config()
+
+    torch.manual_seed(config["seed"])
+    np.random.seed(config["seed"])
     torch.set_default_dtype(torch.float64)
 
-    device = torch.device("cpu")
     dtype = torch.float64
+    device = torch.device("cpu")
 
-    _print_header(CONFIG)
+    print("=" * 62)
+    print(f"  {problem.display_name}")
+    print("=" * 62)
+    print(f"  z0 = {config['z0']}")
+    print(f"  z* = {config['z_target']}")
+    print(f"  T  = {config['T']}")
+    print("=" * 62)
 
     controller = NeuralController(
-        hidden_dim=CONFIG["hidden_dim"],
-        n_layers=CONFIG["n_layers"],
-        T=CONFIG["T"],
+        input_dim=1,
+        output_dim=problem.control_dim,
+        hidden_dim=config["hidden_dim"],
+        n_layers=config["n_layers"],
+        T=config["T"],
     ).to(dtype=dtype, device=device)
-
-    dynamics = BlockDynamics(controller=controller, mu=CONFIG["mu"])
 
     n_params = sum(p.numel() for p in controller.parameters())
     print(f"\nController parameters: {n_params}")
 
     print("\n--- Training ---")
-    controller, history = train(controller, dynamics, CONFIG)
+    controller, history = train(problem, controller, config)
 
-    t_eval = torch.linspace(0.0, CONFIG["T"], CONFIG["n_eval"], dtype=dtype, device=device)
-    z0_tensor = torch.tensor(CONFIG["z0"], dtype=dtype, device=device)
+    # Evaluate final trajectory
+    t_eval = torch.linspace(0.0, config["T"], config["n_eval"], dtype=dtype, device=device)
+    z0 = torch.tensor(config["z0"], dtype=dtype, device=device)
+    dynamics = problem.create_dynamics(controller, config)
 
     controller.eval()
     with torch.no_grad():
         z_traj = odeint(
-            dynamics,
-            z0_tensor,
-            t_eval,
-            method=CONFIG["solver"],
-            rtol=CONFIG["rtol"],
-            atol=CONFIG["atol"],
+            dynamics, z0, t_eval,
+            method=config["solver"], rtol=config["rtol"], atol=config["atol"],
         )
         u_traj = controller.get_control_trajectory(t_eval)
 
-    t_np = t_eval.numpy()
-    z_np = z_traj.numpy()
-    u_np = u_traj.numpy()
-
-    z_final = z_np[-1]
-    target = np.array(CONFIG["z_target"])
+    z_final = z_traj[-1].numpy()
+    target = np.array(config["z_target"])
     error = np.linalg.norm(z_final - target)
 
-    print("\n--- Neural ODE result ---")
-    print(f"  Final state:       x(T) = {z_final[0]:.6f}, v(T) = {z_final[1]:.6f}")
-    print(f"  Target:            x*   = {target[0]}, v* = {target[1]}")
-    print(f"  Euclidean error:   {error:.4e}")
-    print(f"  Final total loss:  {history['total'][-1]:.6f}")
+    print(f"\n--- Result ---")
+    print(f"  Final state:     {z_final}")
+    print(f"  Target:          {target}")
+    print(f"  Euclidean error: {error:.4e}")
+    print(f"  Final loss:      {history['total'][-1]:.6f}")
 
-    print("\n--- Reference solution ---")
-    ref = solve_reference(CONFIG, n_nodes=CONFIG["n_eval"])
-    ref_final = np.array([ref["x"][-1], ref["v"][-1]])
-    ref_error = np.linalg.norm(ref_final - target)
-    print(f"  Euclidean error:   {ref_error:.4e}")
+    # Reference
+    reference = None
+    if problem.has_reference():
+        print("\n--- Reference ---")
+        reference = problem.solve_reference(config)
+        ref_error = np.linalg.norm(reference.z[-1] - target)
+        print(f"  Ref error:       {ref_error:.4e}")
+        print(f"  Ref cost:        {reference.cost:.6f}")
 
-    print("\n--- Plot ---")
-    plot_results(
-        t_nn=t_np,
-        z_nn=z_np,
-        u_nn=u_np,
-        ref=ref,
-        history=history,
-        config=CONFIG,
-        save_path=CONFIG["save_path"],
+    # Plot
+    from neural_ode_control.base import TrajectoryResult
+
+    state_labels = {2: ["x", "v"], 4: ["x", "y", "vx", "vy"]}.get(
+        problem.state_dim, [f"z{i}" for i in range(problem.state_dim)],
     )
+    control_labels = {1: ["u"], 2: ["Fx", "Fy"]}.get(
+        problem.control_dim, [f"u{i}" for i in range(problem.control_dim)],
+    )
+
+    trajectory = TrajectoryResult(
+        t=t_eval.numpy(),
+        z=z_traj.numpy(),
+        u=u_traj.numpy(),
+        state_labels=state_labels,
+        control_labels=control_labels,
+    )
+
+    fig = problem.plot_results(trajectory, history, config, reference)
+    save_path = f"results_{problem_name}.png"
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"\nPlot saved: {save_path}")
+
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
     print("\n=== Done ===")
 
 
-def _print_header(config: dict) -> None:
-    """Print a summary of the run configuration."""
-    print("=" * 62)
-    print("  Neural ODE Optimal Control – Block with Friction")
-    print("=" * 62)
-    print(f"  Initial state:  z0 = {config['z0']}")
-    print(f"  Target state:   z* = {config['z_target']}")
-    print(f"  Time horizon:   T  = {config['T']}")
-    print(f"  Friction:       mu = {config['mu']}")
-    print(f"  Epochs:         {config['n_epochs']}  (early stop: ||z(T)-z*|| < {config['early_stop']:.0e})")
-    print("=" * 62)
-
-
 if __name__ == "__main__":
-    main()
+    name = sys.argv[1] if len(sys.argv) > 1 else "block_1d"
+    available = [n for n, _ in list_problems()]
+    if name not in available:
+        print(f"Unknown problem '{name}'. Available: {available}")
+        sys.exit(1)
+    main(name)
