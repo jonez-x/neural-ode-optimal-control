@@ -71,7 +71,9 @@ def solve_reference(config: dict[str, Any], n_nodes: int = 200) -> ReferenceResu
     )
 
     z_final = z_traj[-1]
-    _trapz = getattr(np, "trapezoid", np.trapz)
+    _trapz = getattr(np, "trapezoid", None)
+    if _trapz is None:
+        _trapz = np.trapz
     energy = float(_trapz(u_optimal ** 2, t_grid))
     cost = w_energy * energy + w_terminal * float(np.sum((z_final - z_target) ** 2))
 

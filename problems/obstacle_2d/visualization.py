@@ -14,6 +14,7 @@ import matplotlib.ticker as mticker
 import numpy as np
 
 from neural_ode_control.base import ReferenceResult, TrajectoryResult
+from problems.obstacle_2d.problem import _get_obstacles
 
 COLORS = {
     "traj": "#1f77b4",
@@ -42,8 +43,9 @@ def plot_results(
         fontsize=13, y=1.02,
     )
 
-    _plot_trajectory_2d(axes[0], trajectory, config)
-    _plot_control(axes[1], trajectory)
+    first_close_z = history.get("first_close_z")
+    _plot_trajectory_2d(axes[0], trajectory, config, reference, first_close_z=first_close_z)
+    _plot_control(axes[1], trajectory, reference)
     _plot_loss(axes[2], history)
 
     plt.tight_layout()
@@ -64,20 +66,33 @@ def _apply_style() -> None:
     })
 
 
-def _plot_trajectory_2d(ax, traj: TrajectoryResult, config: dict) -> None:
+def _plot_trajectory_2d(
+    ax, traj: TrajectoryResult, config: dict,
+    reference: Optional[ReferenceResult] = None,
+    first_close_z: Optional[np.ndarray] = None,
+) -> None:
     z0 = config["z0"]
     z_target = config["z_target"]
-    obs_c = config["obstacle_center"]
-    obs_r = config["obstacle_radius"]
 
-    # Obstacle
-    circle = plt.Circle(obs_c, obs_r, color=COLORS["obstacle"], alpha=0.3, zorder=2)
-    ax.add_patch(circle)
-    circle_edge = plt.Circle(obs_c, obs_r, fill=False, color=COLORS["obstacle"], lw=2, zorder=3)
-    ax.add_patch(circle_edge)
+    # Obstacles (single or multiple)
+    for obs in _get_obstacles(config):
+        obs_c = obs["center"]
+        obs_r = obs["radius"]
+        ax.add_patch(plt.Circle(obs_c, obs_r, color=COLORS["obstacle"], alpha=0.3, zorder=2))
+        ax.add_patch(plt.Circle(obs_c, obs_r, fill=False, color=COLORS["obstacle"], lw=2, zorder=3))
 
-    # Trajectory
-    ax.plot(traj.z[:, 0], traj.z[:, 1], color=COLORS["traj"], lw=2, zorder=4, label="Neural ODE")
+    # First trajectory that reached the target region
+    if first_close_z is not None:
+        ax.plot(first_close_z[:, 0], first_close_z[:, 1], color="orange",
+                lw=1.4, ls="--", alpha=0.75, zorder=4, label="First close trajectory")
+
+    # Reference trajectory
+    if reference is not None:
+        ax.plot(reference.z[:, 0], reference.z[:, 1], color=COLORS["traj"],
+                lw=1.5, ls="--", alpha=0.7, zorder=4, label="Reference (numerical)")
+
+    # Neural ODE trajectory
+    ax.plot(traj.z[:, 0], traj.z[:, 1], color=COLORS["traj"], lw=2, zorder=5, label="Neural ODE")
 
     # Direction arrows along trajectory
     n = len(traj.z)
@@ -99,20 +114,35 @@ def _plot_trajectory_2d(ax, traj: TrajectoryResult, config: dict) -> None:
     ax.set_xlabel("$x$")
     ax.set_ylabel("$y$")
     ax.set_title("2D Trajectory")
+
+    # Fix axis limits based on trained trajectory + start/target (ignore initial trajectory)
+    xs = np.concatenate([[z0[0], z_target[0]], traj.z[:, 0]])
+    ys = np.concatenate([[z0[1], z_target[1]], traj.z[:, 1]])
+    margin = 0.3
+    ax.set_xlim(xs.min() - margin, xs.max() + margin)
+    ax.set_ylim(ys.min() - margin, ys.max() + margin)
+
     ax.set_aspect("equal")
     ax.legend(loc="best")
 
 
-def _plot_control(ax, traj: TrajectoryResult) -> None:
+def _plot_control(
+    ax, traj: TrajectoryResult,
+    reference: Optional[ReferenceResult] = None,
+) -> None:
     t = traj.t
     u = traj.u
     if u.ndim == 1:
         ax.plot(t, u, color=COLORS["fx"], label="u")
     else:
-        ax.plot(t, u[:, 0], color=COLORS["fx"], label="$F_x$")
-        ax.plot(t, u[:, 1], color=COLORS["fy"], label="$F_y$")
+        ax.plot(t, u[:, 0], color=COLORS["fx"], label="$F_x$ Neural ODE")
+        ax.plot(t, u[:, 1], color=COLORS["fy"], label="$F_y$ Neural ODE")
         magnitude = np.sqrt(u[:, 0] ** 2 + u[:, 1] ** 2)
-        ax.plot(t, magnitude, color="gray", ls=":", alpha=0.7, label="$||u||$")
+        ax.plot(t, magnitude, color="gray", ls=":", alpha=0.7, label="$||u||$ Neural ODE")
+    if reference is not None:
+        u_ref = reference.u
+        ax.plot(reference.t, u_ref[:, 0], color=COLORS["fx"], ls="--", alpha=0.7, label="$F_x$ Ref")
+        ax.plot(reference.t, u_ref[:, 1], color=COLORS["fy"], ls="--", alpha=0.7, label="$F_y$ Ref")
     ax.axhline(0, color="gray", lw=0.8)
     ax.set_xlabel("Time $t$")
     ax.set_ylabel("Control")

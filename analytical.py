@@ -127,7 +127,9 @@ def solve_reference(
     # ------------------------------------------------------------------
     z_final = z_traj[-1]
     terminal_error = np.linalg.norm(z_final - z_target)
-    _trapz = getattr(np, "trapezoid", np.trapz)
+    _trapz = getattr(np, "trapezoid", None)
+    if _trapz is None:
+        _trapz = np.trapz
     energy = float(_trapz(u_optimal ** 2, t_grid))
     cost = w_energy * energy + w_terminal * float(np.sum((z_final - z_target) ** 2))
 
