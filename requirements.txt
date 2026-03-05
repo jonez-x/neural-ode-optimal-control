@@ -1,6 +1,4 @@
-torch>=2.0
-torchdiffeq>=0.2.3
-numpy
-scipy
+torch
+torchdiffeq
 matplotlib
-streamlit
+numpy
